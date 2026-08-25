@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import random
 import re
 import unittest
@@ -6,16 +8,48 @@ from pathlib import Path
 from deep_tests.security_model import (
     BoundaryViolation,
     Principal,
+    ProximityEnvelopeVerifier,
     ReplayWindow,
     authorize_read,
     normalize_relative_path,
     redact,
     sign,
+    sign_proximity_envelope,
     validate_outbound_url,
 )
 
 
 class SecurityBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def proximity_envelope(secret: bytes, *, sequence: int = 1, message_id: str = "message-1") -> dict:
+        ciphertext = base64.urlsafe_b64encode(b"opaque-encrypted-clip").rstrip(b"=").decode()
+        envelope = {
+            "protocol": "cliptown.proximity.v1",
+            "message_kind": "clipboard_offer",
+            "message_id": message_id,
+            "session_id": "AQIDBAUGBwgJCgsMDQ4PEA",
+            "sequence": sequence,
+            "issued_at_unix_ms": 1_700_000_000_000,
+            "expires_at_unix_ms": 1_700_000_120_000,
+            "sender_device_id": "22222222-2222-4222-8222-222222222222",
+            "recipient_device_id": "33333333-3333-4333-8333-333333333333",
+            "scope": "cliptown:clipboard:import",
+            "ciphertext": ciphertext,
+            "ciphertext_sha256": hashlib.sha256(b"opaque-encrypted-clip").hexdigest(),
+            "signing_key_id": "device-key-1",
+            "signature": "",
+        }
+        envelope["signature"] = sign_proximity_envelope(secret, envelope)
+        return envelope
+
+    @staticmethod
+    def proximity_verifier() -> ProximityEnvelopeVerifier:
+        return ProximityEnvelopeVerifier(
+            local_device_id="33333333-3333-4333-8333-333333333333",
+            peer_device_id="22222222-2222-4222-8222-222222222222",
+            session_id="AQIDBAUGBwgJCgsMDQ4PEA",
+        )
+
     def test_path_traversal_corpus_is_rejected(self) -> None:
         traversal = [
             "../secret",
@@ -69,6 +103,58 @@ class SecurityBoundaryTests(unittest.TestCase):
             ReplayWindow(max_skew_seconds=10).verify(
                 secret, now - 11, "nonce-3", body, sign(secret, now - 11, "nonce-3", body), now=now
             )
+
+    def test_bluetooth_envelopes_are_verified_before_replay_state_changes(self) -> None:
+        secret = b"synthetic-enrolled-device-key"
+        envelope = self.proximity_envelope(secret)
+        verifier = self.proximity_verifier()
+
+        forged = {**envelope, "signature": "0" * 64}
+        with self.assertRaisesRegex(BoundaryViolation, "signature mismatch"):
+            verifier.verify(secret, forged, now_ms=1_700_000_000_001)
+
+        verifier.verify(secret, envelope, now_ms=1_700_000_000_001)
+        self.assertEqual(verifier.last_sequence, 1)
+        with self.assertRaisesRegex(BoundaryViolation, "replay"):
+            verifier.verify(secret, envelope, now_ms=1_700_000_000_002)
+
+    def test_bluetooth_context_expiry_scope_and_credential_boundaries_fail_closed(self) -> None:
+        secret = b"synthetic-enrolled-device-key"
+        baseline = self.proximity_envelope(secret)
+
+        cases = {
+            "wrong recipient": {**baseline, "recipient_device_id": "44444444-4444-4444-8444-444444444444"},
+            "wrong sender": {**baseline, "sender_device_id": "44444444-4444-4444-8444-444444444444"},
+            "wrong session": {**baseline, "session_id": "ERITFBUWFxgZGhscHR4fIA"},
+            "scope confusion": {**baseline, "scope": "shared-auth:step-up:relay"},
+            "expired": {**baseline, "expires_at_unix_ms": 1_700_000_000_001},
+            "from future": {
+                **baseline,
+                "issued_at_unix_ms": 1_700_000_030_002,
+                "expires_at_unix_ms": 1_700_000_120_000,
+            },
+            "digest tamper": {**baseline, "ciphertext": "AQID"},
+            "credential field": {**baseline, "otp": "123456"},
+        }
+        for name, envelope in cases.items():
+            envelope["signature"] = sign_proximity_envelope(secret, envelope)
+            with self.subTest(name=name), self.assertRaises(BoundaryViolation):
+                self.proximity_verifier().verify(secret, envelope, now_ms=1_700_000_000_001)
+
+    def test_bluetooth_offline_clip_and_threefa_relay_keep_distinct_scopes(self) -> None:
+        secret = b"synthetic-enrolled-device-key"
+        verifier = self.proximity_verifier()
+        clip = self.proximity_envelope(secret)
+        relay = self.proximity_envelope(secret, sequence=2, message_id="message-2")
+        relay.update(
+            message_kind="shared_auth_step_up",
+            scope="shared-auth:step-up:relay",
+        )
+        relay["signature"] = sign_proximity_envelope(secret, relay)
+
+        verifier.verify(secret, clip, now_ms=1_700_000_000_001)
+        verifier.verify(secret, relay, now_ms=1_700_000_000_002)
+        self.assertNotEqual(relay["scope"], "shared-auth:factor:success")
 
     def test_redaction_removes_token_and_bearer_shapes(self) -> None:
         github_shape = "gh" + "p_" + "A" * 32
