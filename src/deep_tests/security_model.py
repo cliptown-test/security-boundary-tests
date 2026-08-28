@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import json
 import re
 import time
 import urllib.parse
@@ -34,11 +35,20 @@ PROXIMITY_ENVELOPE_FIELDS = frozenset(
         "signature",
     }
 )
+PROXIMITY_SCOPES = {
+    "pairing_hello": "cliptown:device:pair",
+    "clipboard_offer": "cliptown:clipboard:import",
+    "clipboard_chunk": "cliptown:clipboard:import",
+    "shared_auth_step_up": "shared-auth:step-up:relay",
+}
 PROXIMITY_FORBIDDEN_FIELDS = frozenset(
     {
         "access_token",
+        "approval_result",
+        "assurance",
         "assurance_claim",
         "biometric",
+        "factor_proof",
         "factor_result",
         "id_token",
         "otp",
@@ -78,6 +88,15 @@ def _decode_base64url(value: object) -> bytes:
     return decoded
 
 
+def _proximity_signing_bytes(envelope: dict[str, object]) -> bytes:
+    unsigned = {key: value for key, value in envelope.items() if key != "signature"}
+    return json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def sign_proximity_envelope(secret: bytes, envelope: dict[str, object]) -> str:
+    return hmac.new(secret, _proximity_signing_bytes(envelope), hashlib.sha256).hexdigest()
+
+
 @dataclass
 class ProximityReplayState:
     recipient_device_id: str
@@ -99,7 +118,7 @@ def validate_proximity_envelope(
         raise BoundaryViolation("credential-shaped proximity field is forbidden")
     if envelope["protocol"] != "cliptown.proximity.v1":
         raise BoundaryViolation("unsupported proximity protocol")
-    if envelope["scope"] not in {"cliptown:clipboard:import", "shared-auth:step-up:relay"}:
+    if envelope["scope"] not in {"cliptown:clipboard:import", "shared-auth:step-up:relay", "cliptown:device:pair"}:
         raise BoundaryViolation("unsupported proximity scope")
     if envelope["recipient_device_id"] != state.recipient_device_id:
         raise BoundaryViolation("wrong proximity recipient")
@@ -135,6 +154,62 @@ def validate_proximity_envelope(
     state.seen_message_ids.add(message_id)
     state.last_sequence = sequence
     return ciphertext
+
+
+@dataclass
+class ProximityEnvelopeVerifier:
+    local_device_id: str
+    peer_device_id: str
+    session_id: str
+    max_clock_skew_ms: int = 30_000
+    seen_messages: set[str] = field(default_factory=set)
+    last_sequence: int = 0
+
+    def verify(self, secret: bytes, envelope: dict[str, object], now_ms: int) -> None:
+        if set(envelope) != PROXIMITY_ENVELOPE_FIELDS:
+            raise BoundaryViolation("proximity envelopes are closed")
+        if _has_forbidden_proximity_field(envelope):
+            raise BoundaryViolation("credential and assurance fields are forbidden")
+        if envelope["protocol"] != "cliptown.proximity.v1":
+            raise BoundaryViolation("unsupported proximity protocol")
+        if PROXIMITY_SCOPES.get(envelope["message_kind"]) != envelope["scope"]:
+            raise BoundaryViolation("message kind and scope do not match")
+        if envelope["recipient_device_id"] != self.local_device_id:
+            raise BoundaryViolation("wrong proximity recipient")
+        if envelope["sender_device_id"] != self.peer_device_id:
+            raise BoundaryViolation("wrong proximity sender")
+        if envelope["session_id"] != self.session_id:
+            raise BoundaryViolation("wrong proximity session")
+
+        issued_at = envelope["issued_at_unix_ms"]
+        expires_at = envelope["expires_at_unix_ms"]
+        sequence = envelope["sequence"]
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (issued_at, expires_at, sequence)):
+            raise BoundaryViolation("proximity time and sequence fields must be integers")
+        if sequence < 1 or sequence > 0x7FFFFFFF:
+            raise BoundaryViolation("invalid proximity sequence")
+        if expires_at <= issued_at or expires_at - issued_at > 120_000:
+            raise BoundaryViolation("invalid proximity lifetime")
+        if issued_at > now_ms + self.max_clock_skew_ms or expires_at <= now_ms:
+            raise BoundaryViolation("proximity envelope is expired or from the future")
+
+        ciphertext = _decode_base64url(envelope["ciphertext"])
+        if not ciphertext or len(ciphertext) > 32 * 1024:
+            raise BoundaryViolation("proximity ciphertext exceeds the reviewed bound")
+        digest = hashlib.sha256(ciphertext).hexdigest()
+        if not hmac.compare_digest(digest, str(envelope["ciphertext_sha256"])):
+            raise BoundaryViolation("proximity ciphertext digest mismatch")
+        expected_signature = sign_proximity_envelope(secret, envelope)
+        if not hmac.compare_digest(expected_signature, str(envelope["signature"])):
+            raise BoundaryViolation("proximity device signature mismatch")
+
+        message_id = str(envelope["message_id"])
+        if message_id in self.seen_messages:
+            raise BoundaryViolation("proximity message replay")
+        if sequence <= self.last_sequence:
+            raise BoundaryViolation("proximity message reordered")
+        self.seen_messages.add(message_id)
+        self.last_sequence = sequence
 
 
 def accepts_threefa_assurance(amr: set[str], *, shared_auth_result_verified: bool) -> bool:
