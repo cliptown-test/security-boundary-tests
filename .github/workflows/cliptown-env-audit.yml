@@ -1,0 +1,79 @@
+name: ClipTown env audit consumer
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cliptown-env-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORES_SOPS_REF: f152c11f76cc14b2af440b47c756b6c97c0aa36b
+
+jobs:
+  exact-head:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out independent security suite
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          path: security-boundary-tests
+
+      - name: Check out immutable ores-sops helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ORESoftware/ores-sops
+          ref: ${{ env.ORES_SOPS_REF }}
+          persist-credentials: false
+          path: ores-sops
+
+      - name: Prove immutable helper identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ores-sops rev-parse HEAD)" = "${ORES_SOPS_REF}"
+
+      - name: Add ores-sops to PATH
+        shell: bash
+        run: printf '%s\n' "${GITHUB_WORKSPACE}/ores-sops" >> "${GITHUB_PATH}"
+
+      - name: Certify ClipTown env bootstrap boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          normal="${RUNNER_TEMP}/normal-consumer"
+          mkdir -p "${normal}"
+          git -C "${normal}" init --quiet
+          cd "${normal}"
+          ores-sops ensure-dec
+          test -d env/dec
+          test "$(stat -c '%a' env/dec)" = 700
+
+          redirected="${RUNNER_TEMP}/redirected-consumer"
+          outside="${RUNNER_TEMP}/outside"
+          mkdir -p "${redirected}" "${outside}"
+          git -C "${redirected}" init --quiet
+          ln -s "${outside}" "${redirected}/env"
+          if (cd "${redirected}" && ores-sops ensure-dec); then
+            echo 'ores-sops followed a redirected env path' >&2
+            exit 1
+          fi
+          test ! -e "${outside}/dec"
+
+          invalid="${RUNNER_TEMP}/invalid-consumer"
+          mkdir -p "${invalid}/env"
+          git -C "${invalid}" init --quiet
+          printf 'not a directory\n' > "${invalid}/env/dec"
+          if (cd "${invalid}" && ores-sops ensure-dec); then
+            echo 'ores-sops accepted a non-directory env/dec path' >&2
+            exit 1
+          fi
